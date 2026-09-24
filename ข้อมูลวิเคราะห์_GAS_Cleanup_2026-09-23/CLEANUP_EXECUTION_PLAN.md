@@ -9,6 +9,44 @@
 **สถานะก่อนเริ่ม:** READY FOR CONTROLLED CLEANUP --- ยังไม่อนุญาตให้ Apply กับ
 Production
 
+> ## คำตัดสินก่อนเริ่ม (อัปเดตจากการตรวจชุดโค้ดและ snapshot 23/09/2026)
+>
+> แผนนี้มีลำดับงานและหลักฐานสำหรับ **dry-run** ที่ดี แต่ยัง **ไม่พร้อมอนุมัติ
+> Apply** จนกว่าจะปิดเงื่อนไขบังคับด้านล่างครบทั้งหมด.  เหตุผลคือ Cleanup Suite
+> ที่แนบมามี `CLEANUP_LOG` ระดับการรันและมี `PHONE_EXTRACTED`/`CLEANUP_DATE`
+> สำหรับเฟส 1 แล้ว แต่ยังไม่มีการสร้างหรือเขียน `CLEANUP_AUDIT` ตาม schema
+> ที่กำหนดในแผน; Phase 2 และ 3 เขียนทับทั้งคอลัมน์แบบ batch และ Phase 1c
+> แก้/ลบแถวโดยไม่มี row-level audit.  ดังนั้น backup เพียงอย่างเดียวไม่พอสำหรับ
+> trace หรือ rollback รายรายการ.
+>
+> **ผลการตัดสิน:** อนุญาตเฉพาะ Step 00--04 และทุก dry-run; ห้ามกด Apply
+> Phase 1/1c/2/3 หรือ Promote จนกว่าจะผ่าน "Implementation Gate" นี้.
+
+### Implementation Gate — ต้องทำและทดสอบก่อน Apply
+
+1. **ทำ `CLEANUP_AUDIT` จริงในโค้ด** ไม่ใช่เพียงระบุไว้ในเอกสาร โดยใช้ header:
+   `RUN_ID, TIMESTAMP, PHASE, MD_ID, FIELD, OLD_VALUE, NEW_VALUE, REASON,
+   EVIDENCE, CONFIDENCE, ACTION, OPERATOR, ROLLBACK_STATUS`.
+2. สร้าง `RUN_ID` ใหม่ต่อการ Apply หนึ่งครั้ง, รับ/บันทึก `OPERATOR`, และเขียน
+   audit record ของทุก cell ที่เปลี่ยน **ก่อนหรือในธุรกรรมเดียวกับ** การเขียน
+   MASTER. ถ้าเขียน audit ไม่สำเร็จ ต้อง abort ก่อนเกิด master mutation.
+3. ครอบคลุม Phase 1 (รวม `PHONE_EXTRACTED` และ `CLEANUP_DATE`), Phase 2
+   (`U/V/W/X/AA`), Phase 3 (`N/O`) และ Phase 1c (KEEP/DELETE, ค่า aggregate
+   และทุก row ที่ลบ). ห้ามนับ `CLEANUP_LOG` หรือ `P*_REVIEW` เป็น audit แทน.
+4. เพิ่ม production guard แบบ allow-list ของ Spreadsheet ID สำหรับ controlled
+   cleanup copy; ค่าเริ่มต้นต้อง deny. ต้องบันทึก ID/URL ของ copy และ backup
+   ใน `CLEANUP_STATUS`. การมีเมนู confirmation หรือ `LockService` ไม่ใช่ guard
+   ที่เพียงพอ.
+5. ทดสอบแบบ integration บนสำเนาที่ throwaway: Apply แล้วตรวจ row count,
+   MD_ID, protected fields, allowed-field diff และจำนวน audit rows; จากนั้น
+   restore จาก `BK_MASTER_*` และตรวจค่าเท่ากับ baseline. แนบผลทดสอบกับ run log.
+
+### เกณฑ์อนุมัติ Apply หลังปิด Gate
+
+ผู้รับผิดชอบต้องลงชื่อรับรองว่า (ก) audit test ผ่าน, (ข) rollback test ผ่าน,
+(ค) spreadsheet ID เป็น controlled copy, (ง) ผล dry-run ล่าสุดได้รับอนุมัติ และ
+(จ) full-file backup URL ใช้งานได้. หากข้อใดขาด ให้ถือว่า **STOP**.
+
 ------------------------------------------------------------------------
 
 ## 0. หลักการควบคุมที่ต้องยึดตลอดงาน
@@ -395,7 +433,7 @@ try { addCleanupMenu_(); } catch (e) { Logger.log(e); }
 58_CleanupMenu.gs
 ```
 
-และเพิ่ม Audit layer ตาม Step 01.7 ด้านล่างก่อน Apply จริง
+และเพิ่ม Audit layer ที่ผ่าน Implementation Gate ข้างต้นก่อน Apply จริง
 
 ------------------------------------------------------------------------
 
@@ -496,7 +534,7 @@ CLEANUP_AUDIT
 4.  Patch `99_SelfTest`
 5.  Add `addCleanupMenu_()` เข้า `03_Menu.gs`
 6.  เพิ่ม Cleanup 50--58
-7.  เพิ่ม Audit layer
+7.  เพิ่มและทดสอบ Audit layer ตาม Implementation Gate
 8.  Save ทุกไฟล์
 9.  รัน `stampScriptVersion()`
 10. Refresh Spreadsheet
@@ -522,7 +560,7 @@ onOpen
 [PASS] FIX-A active
 [PASS] SelfTest Test 9 registered
 [PASS] CLEANUP MASTER menu ปรากฏ
-[PASS] CLEANUP_AUDIT พร้อมใช้งาน
+[PASS] CLEANUP_AUDIT ถูกเขียนจริงครบทุก mutation และทดสอบ rollback แล้ว
 ```
 
 ถ้า compile error หรือ duplicate function:
